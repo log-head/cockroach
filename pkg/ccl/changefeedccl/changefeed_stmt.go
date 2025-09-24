@@ -17,6 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedvalidators"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/checkpoint"
+	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/tableset"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/cloud/externalconn"
@@ -57,6 +58,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log/channel"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/span"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
@@ -445,7 +447,13 @@ func coreChangefeed(
 			knobs.BeforeDistChangefeed()
 		}
 
-		err := distChangefeedFlow(ctx, p, 0 /* jobID */, details, description, localState, resultsCh, nil, targets)
+		var schemaTS hlc.Timestamp
+		if h := localState.progress.GetHighWater(); h != nil && !h.IsEmpty() {
+			schemaTS = *h
+		} else {
+			schemaTS = details.StatementTime
+		}
+		err := distChangefeedFlow(ctx, p, 0 /* jobID */, details, description, localState, resultsCh, nil, targets, schemaTS)
 		if err == nil {
 			log.Changefeed.Infof(ctx, "core changefeed completed with no error")
 			return nil
@@ -1040,6 +1048,7 @@ func getTargetDescriptors(
 	tableAndParentDescs []catalog.Descriptor,
 	err error,
 ) {
+	fmt.Printf("getTargetDescriptors at ts %s, initialHighWater %s\n", statementTime, initialHighWater)
 	if len(targets.Databases) > 0 && len(targets.Tables.TablePatterns) > 0 {
 		return nil, nil, nil, errors.Errorf(`CHANGEFEED cannot target both databases and tables`)
 	}
@@ -1609,6 +1618,15 @@ func (b *changefeedResumer) resumeWithRetries(
 		b.mu.perNodeAggregatorStats[componentID] = *meta
 	}
 
+	mm := mon.NewMonitor(mon.Options{
+		Name:      mon.MakeName("test-mm"),
+		Limit:     1024 * 1024,
+		Increment: 128,
+		Settings:  cluster.MakeTestingClusterSettings(),
+	})
+	mm.Start(ctx, nil, mon.NewStandaloneBudget(1024*2024))
+	defer mm.Stop(ctx)
+
 	maxBackoff := changefeedbase.MaxRetryBackoff.Get(&execCfg.Settings.SV)
 	backoffReset := changefeedbase.RetryBackoffReset.Get(&execCfg.Settings.SV)
 	for r := getRetry(ctx, maxBackoff, backoffReset); r.Next(); {
@@ -1624,24 +1642,112 @@ func (b *changefeedResumer) resumeWithRetries(
 				knobs.BeforeDistChangefeed()
 			}
 
-			confPoller := make(chan struct{})
+			var watcher *tableset.Watcher
+			watcherChan := make(chan []tableset.TableDiff)
+			runningChangefeedChan := make(chan struct{})
 			g := ctxgroup.WithContext(ctx)
-			targets, err := AllTargets(ctx, details, execCfg)
+
+			fmt.Printf("Changefeed resumer: statement time: %s\n", details.StatementTime)
+			// Set timestamps
+			// var initialHighWater hlc.Timestamp
+			var schemaTS hlc.Timestamp
+			if h := localState.progress.GetHighWater(); h != nil && !h.IsEmpty() {
+				schemaTS = *h
+			} else {
+				schemaTS = details.StatementTime
+			}
+			fmt.Printf("Changefeed resumer: schemaTS: %s\n", schemaTS)
+
+			// Fetch targets at the schema timestamp.
+			targets, err := AllTargetsAtTimestamp(ctx, details, execCfg, schemaTS)
 			if err != nil {
 				return err
 			}
+
+			// If db-level changefeed with empty tableset, create a watcher.
+			// Goroutine to start the changefeed will block on the watcherChan.
+			if targets.NumUniqueTables() == 0 {
+
+				if len(details.TargetSpecifications) == 0 {
+					return errors.New("no target specifications")
+				}
+
+				// Create watcher dependencies
+				spec := details.TargetSpecifications[0]
+				if spec.Type != jobspb.ChangefeedTargetSpecification_DATABASE {
+					return errors.New("target specification is not a database, so no tables to watch")
+				}
+				dbID := spec.DescID
+				// TODO: Verify this. When would dbID be 0?
+				if dbID == 0 {
+					return errors.New("database ID is 0, so no tables to watch")
+				}
+				filter := tableset.Filter{
+					DatabaseID: dbID,
+				}
+
+				// Create a watcher for the database.
+				watcher = tableset.NewWatcher(filter, execCfg, mm, int64(jobID))
+				timestamp := schemaTS // TODO: Should this be HWM?
+				g.GoCtx(func(ctx context.Context) error {
+					err := watcher.Start(ctx, timestamp)
+					if err != nil {
+						return err
+					}
+					return nil
+				})
+			} else {
+				close(watcherChan)
+			}
+
+			// Start the changefeed.
 			g.GoCtx(func(ctx context.Context) error {
-				defer close(confPoller)
-				return distChangefeedFlow(ctx, jobExec, jobID, details, description, localState, startedCh, onTracingEvent, targets)
+				defer close(runningChangefeedChan)
+
+				// If db-level changefeed with empty tableset, wait for the watcher to receive the diffs.
+				if targets.NumUniqueTables() == 0 {
+					fmt.Println("no target tables, blocking on watcherChan")
+					diffs := <-watcherChan
+					fmt.Printf("received diffs: %v\n", diffs)
+					if len(diffs) == 0 {
+						return errors.New("no diffs received from watcher")
+					}
+					earliestDiff := diffs[0]
+					if earliestDiff.Added.ID == 0 {
+						return errors.New("no added table")
+					}
+					schemaTS = earliestDiff.AsOf
+					fmt.Printf("Changefeed resumer: schemaTS of table (from diff): %s\n", schemaTS)
+					for _, diff := range diffs {
+						if diff.AsOf.LessEq(schemaTS) {
+							if diff.Dropped.ID != 0 {
+								return errors.New("dropping table while tableset should be empty")
+							}
+							targets.Add(changefeedbase.Target{
+								DescID:            diff.Added.ID,
+								FamilyName:        "",
+								StatementTimeName: changefeedbase.StatementTimeName(diff.Added.Name),
+							})
+						} else {
+							break
+						}
+					}
+					// TODO: close the watcher. Set equal to nil.
+				}
+
+				// Pass the schemaTS to distChangefeedFlow. If watcher not used, it is either HWM or statement time. If watcher used, it is the earliest diff.
+				return distChangefeedFlow(ctx, jobExec, jobID, details, description, localState, startedCh, onTracingEvent, targets, schemaTS)
 			})
+
+			// Poll for updated configuration and send diffs to watcherChan.
 			g.GoCtx(func(ctx context.Context) error {
-				t := time.NewTicker(15 * time.Second)
+				t := time.NewTicker(3 * time.Second)
 				defer t.Stop()
 				for {
 					select {
 					case <-ctx.Done():
 						return ctx.Err()
-					case <-confPoller:
+					case <-runningChangefeedChan:
 						return nil
 					case <-t.C:
 						newDest, err := reloadDest(ctx, jobID, execCfg)
@@ -1650,6 +1756,21 @@ func (b *changefeedResumer) resumeWithRetries(
 						} else if newDest != resolvedDest {
 							resolvedDest = newDest
 							return replanErr
+						}
+						if watcher == nil {
+							continue
+						}
+						fmt.Println("tick")
+						unchanged, diffs, err := watcher.PopUnchangedUpTo(ctx, execCfg.Clock.Now())
+						if err != nil {
+							return err
+						}
+						if !unchanged {
+							if len(diffs) == 0 {
+								return errors.New("no diffs")
+							}
+							fmt.Printf("sending diffs to watcherChan: %v\n", diffs)
+							watcherChan <- diffs
 						}
 					}
 				}
@@ -1686,6 +1807,8 @@ func (b *changefeedResumer) resumeWithRetries(
 		log.Changefeed.Warningf(ctx, `Changefeed job %d encountered transient error: %v (attempt %d)`,
 			jobID, flowErr, 1+r.CurrentAttempt())
 		lastRunStatusUpdate = b.setJobStatusMessage(ctx, lastRunStatusUpdate, "transient error: %s", flowErr)
+		fmt.Printf(`Changefeed job %d encountered transient error: %v (attempt %d)\n`,
+			jobID, flowErr, 1+r.CurrentAttempt())
 
 		if metrics, ok := execCfg.JobRegistry.MetricsStruct().Changefeed.(*Metrics); ok {
 			sli, err := metrics.getSLIMetrics(details.Opts[changefeedbase.OptMetricsScope])

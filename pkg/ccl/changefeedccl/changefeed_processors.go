@@ -866,6 +866,7 @@ func (ca *changeAggregator) tick() error {
 			ca.sliMetrics.AdmitLatency.RecordValue(timeutil.Since(event.Timestamp().GoTime()).Nanoseconds())
 		}
 		ca.recentKVCount++
+		fmt.Printf("consuming event %s\n", event.String())
 		return ca.eventConsumer.ConsumeEvent(ca.Ctx(), event)
 	case kvevent.TypeResolved:
 		a := event.DetachAlloc()
@@ -1334,7 +1335,7 @@ func newChangeFrontierProcessor(
 	if cf.knobs.OverrideExecCfg != nil {
 		execCfg = cf.knobs.OverrideExecCfg(execCfg)
 	}
-	targets, err := AllTargets(ctx, spec.Feed, execCfg)
+	targets, err := AllTargetsAtTimestamp(ctx, spec.Feed, execCfg, execCfg.Clock.Now())
 	if err != nil {
 		return nil, err
 	}

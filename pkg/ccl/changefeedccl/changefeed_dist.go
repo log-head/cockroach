@@ -56,6 +56,18 @@ const (
 	changeFrontierProcName   = `changefntr`
 )
 
+// // Given some info about a changefeed that is about to be planned,
+// // find the schema timestamp and the initial highwater.
+// func getInitialTimestamps(
+// 	details jobspb.ChangefeedDetails,
+// 	localState *cachedState,
+// ) (hlc.Timestamp, hlc.Timestamp, error) {
+// 	progress := localState.progress
+
+// 	var initialHighWater hlc.Timestamp
+
+// }
+
 // distChangefeedFlow plans and runs a distributed changefeed.
 //
 // One or more ChangeAggregator processors watch table data for changes. These
@@ -84,6 +96,7 @@ func distChangefeedFlow(
 	resultsCh chan<- tree.Datums,
 	onTracingEvent func(ctx context.Context, meta *execinfrapb.TracingAggregatorEvents),
 	targets changefeedbase.Targets,
+	schemaTS hlc.Timestamp,
 ) error {
 	opts := changefeedbase.MakeStatementOptions(details.Opts)
 	progress := localState.progress
@@ -104,19 +117,20 @@ func distChangefeedFlow(
 		}
 		if noHighWater && initialScanType == changefeedbase.NoInitialScan {
 			// If there is a cursor, the statement time has already been set to it.
-			progress.Progress = &jobspb.Progress_HighWater{HighWater: &details.StatementTime}
+			// progress.Progress = &jobspb.Progress_HighWater{HighWater: &details.StatementTime}
+			progress.Progress = &jobspb.Progress_HighWater{HighWater: &schemaTS}
 		}
 	}
 
 	var initialHighWater hlc.Timestamp
-	schemaTS := details.StatementTime
+	// schemaTS := details.StatementTime
 	{
-		if h := progress.GetHighWater(); h != nil && !h.IsEmpty() {
-			initialHighWater = *h
-			// If we have a high-water set, use it to compute the spans, since the
-			// ones at the statement time may have been garbage collected by now.
-			schemaTS = initialHighWater
-		}
+		// if h := progress.GetHighWater(); h != nil && !h.IsEmpty() {
+		// 	initialHighWater = *h
+		// 	// If we have a high-water set, use it to compute the spans, since the
+		// 	// ones at the statement time may have been garbage collected by now.
+		// 	schemaTS = initialHighWater
+		// }
 
 		// We want to fetch the target spans as of the timestamp following the
 		// highwater unless the highwater corresponds to a timestamp of an initial
@@ -136,6 +150,7 @@ func distChangefeedFlow(
 			knobs.StartDistChangefeedInitialHighwater(ctx, initialHighWater)
 		}
 	}
+	fmt.Printf("starting dist changefeed with schemaTS %s, initialHighWater %s\n", schemaTS, initialHighWater)
 	return startDistChangefeed(
 		ctx, execCtx, jobID, schemaTS, details, description, initialHighWater, localState, resultsCh, onTracingEvent, targets)
 }
@@ -155,6 +170,7 @@ func fetchTableDescriptors(
 		if err := txn.KV().SetFixedTimestamp(ctx, ts); err != nil {
 			return errors.Wrapf(err, "setting timestamp for table descriptor fetch")
 		}
+		fmt.Printf("fetchTableDescriptors at ts %s\n", ts)
 		// Note that all targets are currently guaranteed to have a Table ID
 		// and lie within the primary index span. Deduplication is important
 		// here as requesting the same span twice will deadlock.

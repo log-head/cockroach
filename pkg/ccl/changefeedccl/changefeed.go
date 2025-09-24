@@ -8,6 +8,7 @@ package changefeedccl
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
@@ -54,11 +55,24 @@ func makeChangefeedConfigFromJobDetails(
 	}, nil
 }
 
+func AllTargetsAtTimestamp(
+	ctx context.Context, cd jobspb.ChangefeedDetails, execCfg *sql.ExecutorConfig, schemaTS hlc.Timestamp,
+) (changefeedbase.Targets, error) {
+	return AllTargetsWithTimestamp(ctx, cd, execCfg, schemaTS)
+}
+
+func AllTargets(
+	ctx context.Context, cd jobspb.ChangefeedDetails, execCfg *sql.ExecutorConfig,
+) (changefeedbase.Targets, error) {
+	// return AllTargetsWithTimestamp(ctx, cd, execCfg, cd.StatementTime)
+	return AllTargetsWithTimestamp(ctx, cd, execCfg, execCfg.Clock.Now())
+}
+
 // AllTargets gets all the targets listed in a ChangefeedDetails,
 // from the statement time name map in old protos
 // or the TargetSpecifications in new ones.
-func AllTargets(
-	ctx context.Context, cd jobspb.ChangefeedDetails, execCfg *sql.ExecutorConfig,
+func AllTargetsWithTimestamp(
+	ctx context.Context, cd jobspb.ChangefeedDetails, execCfg *sql.ExecutorConfig, schemaTS hlc.Timestamp,
 ) (changefeedbase.Targets, error) {
 	targets := changefeedbase.Targets{}
 	var err error
@@ -72,7 +86,7 @@ func AllTargets(
 					if len(cd.TargetSpecifications) > 1 {
 						return changefeedbase.Targets{}, errors.AssertionFailedf("database-level changefeed is not supported with multiple targets")
 					}
-					targets, err = getTargetsFromDatabaseSpec(ctx, ts, execCfg)
+					targets, err = getTargetsFromDatabaseSpec(ctx, ts, execCfg, schemaTS)
 					if err != nil {
 						return changefeedbase.Targets{}, err
 					}
@@ -106,9 +120,13 @@ func AllTargets(
 }
 
 func getTargetsFromDatabaseSpec(
-	ctx context.Context, ts jobspb.ChangefeedTargetSpecification, execCfg *sql.ExecutorConfig,
+	ctx context.Context, ts jobspb.ChangefeedTargetSpecification, execCfg *sql.ExecutorConfig, schemaTS hlc.Timestamp,
 ) (targets changefeedbase.Targets, err error) {
 	err = sql.DescsTxn(ctx, execCfg, func(ctx context.Context, txn isql.Txn, descs *descs.Collection) error {
+		if err := txn.KV().SetFixedTimestamp(ctx, schemaTS); err != nil {
+			return errors.Wrapf(err, "setting timestamp for database descriptor fetch")
+		}
+		fmt.Printf("getTargetsFromDatabaseSpec at ts %s\n", schemaTS)
 		databaseDescriptor, err := descs.ByIDWithLeased(txn.KV()).Get().Database(ctx, ts.DescID)
 		if err != nil {
 			return err

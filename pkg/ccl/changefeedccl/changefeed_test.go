@@ -224,6 +224,30 @@ func TestDatabaseLevelChangefeedBasics(t *testing.T) {
 	cdcTest(t, testFn)
 }
 
+func TestDatabaseLevelChangefeedEmptyTableset(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
+		sqlDB.Exec(t, `CREATE DATABASE db`)
+		dbcf := feed(t, f, `CREATE CHANGEFEED FOR DATABASE db`)
+		defer closeFeed(t, dbcf)
+
+		// This allows the test to pass
+		time.Sleep(5 * time.Second)
+
+		// create a table
+		sqlDB.Exec(t, `CREATE TABLE db.foo (a INT PRIMARY KEY, b STRING)`)
+		sqlDB.Exec(t, `INSERT INTO db.foo VALUES (0, 'initial')`)
+
+		assertPayloads(t, dbcf, []string{
+			`foo: [0]->{"after": {"a": 0, "b": "initial"}}`,
+		})
+	}
+	cdcTest(t, testFn, feedTestForceSink("enterprise"), feedTestUseRootUserConnection)
+}
+
 func TestDatabaseLevelChangefeedWithIncludeFilter(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
