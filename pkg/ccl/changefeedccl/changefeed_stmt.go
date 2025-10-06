@@ -1639,11 +1639,17 @@ func (b *changefeedResumer) resumeWithRetries(
 			runningChangefeedChan := make(chan struct{})
 			g := ctxgroup.WithContext(ctx)
 
-			// TODO: Get targets at the HWM, if it exists.
-			targets, err := AllTargets(ctx, details, execCfg)
+			var changefeedStartTS hlc.Timestamp
+			if h := localState.progress.GetHighWater(); h != nil && !h.IsEmpty() {
+				changefeedStartTS = *h
+			} else {
+				changefeedStartTS = details.StatementTime
+			}
+			targets, err := AllTargetsWithTS(ctx, details, execCfg, changefeedStartTS)
 			if err != nil {
 				return err
 			}
+			fmt.Printf("resumeWithRetries initially found %d target tables\n", targets.NumUniqueTables())
 			var watcher *tableset.Watcher
 			watcherChan := make(chan []tableset.TableDiff)
 			if targets.NumUniqueTables() == 0 {
@@ -1665,18 +1671,12 @@ func (b *changefeedResumer) resumeWithRetries(
 				filter := tableset.Filter{
 					DatabaseID: dbID,
 				}
-				var initialWatcherTS hlc.Timestamp
-				if h := localState.progress.GetHighWater(); h != nil && !h.IsEmpty() {
-					initialWatcherTS = *h
-				} else {
-					initialWatcherTS = details.StatementTime
-				}
+				fmt.Printf("starting watcher at: %s\n", changefeedStartTS)
 
 				// Create a watcher for the database.
 				watcher = tableset.NewWatcher(filter, execCfg, mm, int64(jobID))
-				timestamp := initialWatcherTS
 				g.GoCtx(func(ctx context.Context) error {
-					err := watcher.Start(ctx, timestamp)
+					err := watcher.Start(ctx, changefeedStartTS)
 					if err != nil {
 						return err
 					}
@@ -1702,32 +1702,16 @@ func (b *changefeedResumer) resumeWithRetries(
 					case diffs := <-watcherChan:
 						fmt.Printf("received diffs: %v\n", diffs)
 						fmt.Printf("watcherChan closed\n")
-						if len(diffs) == 0 {
-							return errors.New("no diffs")
-						}
-						fmt.Printf("received diffs: %v\n", diffs)
-						fmt.Printf("watcherChan closed\n")
 						// Get the diff with the earliest timestamp.
 						earliestDiff := diffs[0]
 						if earliestDiff.Added.ID == 0 {
 							return errors.New("no added table")
 						}
-						earliestTimestamp := earliestDiff.AsOf
-						schemaTSOverride = earliestTimestamp
+						schemaTSOverride = earliestDiff.AsOf
 						fmt.Printf("schemaTSOverride: %s\n", schemaTSOverride)
-						for _, diff := range diffs {
-							if diff.AsOf.LessEq(earliestTimestamp) {
-								if diff.Dropped.ID != 0 {
-									return errors.New("dropping table while tableset should be empty")
-								}
-								targets.Add(changefeedbase.Target{
-									DescID:            diff.Added.ID,
-									FamilyName:        "",
-									StatementTimeName: changefeedbase.StatementTimeName(diff.Added.Name),
-								})
-							} else {
-								break
-							}
+						targets, err = AllTargetsWithTS(ctx, details, execCfg, schemaTSOverride)
+						if err != nil {
+							return err
 						}
 					}
 				}

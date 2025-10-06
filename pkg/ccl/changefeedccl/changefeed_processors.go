@@ -452,6 +452,9 @@ func (ca *changeAggregator) Start(ctx context.Context) {
 	kvFeedHighWater := ca.frontier.Frontier()
 	if needsInitialScan {
 		kvFeedHighWater = ca.spec.Feed.StatementTime
+		fmt.Printf("Using statement time for kv feed high water: %s\n", kvFeedHighWater)
+	} else {
+		fmt.Printf("Using frontier for kv feed high water: %s\n", kvFeedHighWater)
 	}
 
 	// TODO(yevgeniy): Introduce separate changefeed monitor that's a parent
@@ -563,6 +566,7 @@ func (ca *changeAggregator) makeKVFeedCfg(
 	if schemaChange.Policy == changefeedbase.OptSchemaChangePolicyIgnore || initialScanOnly {
 		sf = schemafeed.DoNothingSchemaFeed
 	} else {
+		fmt.Printf("creating schema feed with initial frontier: %s\n", initialHighWater)
 		sf = schemafeed.New(ctx, cfg, schemaChange.EventClass, ca.targets,
 			initialHighWater, &ca.metrics.SchemaFeedMetrics, config.Opts.GetCanHandle())
 	}
